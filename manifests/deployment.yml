@@ -1,0 +1,19 @@
+apiVersion : apps/v1
+kind: Deployment
+metadata:
+  name: apifinancask8s 
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: apifinancask8s
+  template:
+    metadata:
+      labels:
+        app: apifinancask8s
+    spec:
+      containers:
+        - name: apifinancask8s
+          image: CR-DEPLOYMENT/apifinancask8s:TAG-DEPLOYMENT
+          ports:
+          - containerPort: 80

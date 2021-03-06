@@ -1,0 +1,106 @@
+name: dotnet5-tests-api-acr-aks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  IMAGEM_AZURECR: ${{ secrets.AZURECR_REGISTRY }}/apifinancask8s
+  CAMINHO_PROJETO_TESTES: ./APIFinancas.Especificacoes
+  CAMINHO_PROJETO_WEBAPP: ./APIFinancas
+  AZURE_RESOURCE_GROUP_K8S: TesteKubernetes
+  AZURE_CLUSTER_K8S: AKSCluster
+  NAMESPACE_K8S: apifinancas
+  
+jobs:
+  build-docker-tests-push-acr:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+      
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1.7.2
+      with:
+        dotnet-version: 5.0.103
+
+    - name: Build de imagem
+      run: |
+        cd ${{ env.CAMINHO_PROJETO_WEBAPP }}
+        docker build . --file Dockerfile --tag ${{ env.IMAGEM_AZURECR }}:latest
+
+    - name: Criação de container para testes com a API
+      run: |
+        docker run --name api-testes -p 1234:80 -d ${{ env.IMAGEM_AZURECR }}:latest
+        docker container ls
+        
+    - name: Testes com .NET 5 + SpecFlow + xUnit + Refit
+      env:
+        UrlWebAppTestes: http://localhost:1234
+      run: dotnet test ${{ env.CAMINHO_PROJETO_TESTES }} --verbosity minimal --logger:"html;LogFileName=resultado-testes.html"
+      
+    - name: Login no Azure Container Registry
+      uses: docker/login-action@v1.8.0
+      with:
+        registry: ${{ secrets.AZURECR_REGISTRY }}
+        username: ${{ secrets.AZURECR_USERNAME }}
+        password: ${{ secrets.AZURECR_PASSWORD }}
+
+    - name: Geração de tag com número do Build e Push no Azure Container Registry
+      run: |
+        docker tag ${{ env.IMAGEM_AZURECR }}:latest ${{ env.IMAGEM_AZURECR }}:$GITHUB_RUN_NUMBER
+        docker push --all-tags ${{ env.IMAGEM_AZURECR }}
+
+    - name: Upload do Report de Testes como Artifact
+      uses: actions/upload-artifact@v2.2.2
+      if: always()
+      env:
+        CAMINHO_RELATORIO_TESTES: ${{ env.CAMINHO_PROJETO_TESTES }}/TestResults/resultado-testes.html
+      with:
+        name: resultado-execucao-testes
+        path: ${{ env.CAMINHO_RELATORIO_TESTES }}
+        retention-days: 30
+
+  deployment-aks:
+    needs: [build-docker-tests-push-acr]
+    
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Azure Kubernetes Service - set context - Conectando ao cluster
+      uses: Azure/aks-set-context@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }} 
+        resource-group: ${{ env.AZURE_RESOURCE_GROUP_K8S }}
+        cluster-name:  ${{ env.AZURE_CLUSTER_K8S }}
+
+    - name: Azure Kubernetes Service - Criando Secret para acesso ao Container Registry
+      uses: Azure/k8s-create-secret@v1.1
+      with:
+        namespace: ${{ env.NAMESPACE_K8S }}
+        container-registry-url: ${{ secrets.AZURECR_REGISTRY }}
+        container-registry-username: ${{ secrets.AZURECR_USERNAME }}
+        container-registry-password: ${{ secrets.AZURECR_PASSWORD }}
+        secret-name: webapp-k8s-secret
+
+    - name: Configurar manifesto de Deployment
+      run: |
+        sed -i 's/CR-DEPLOYMENT/${{ secrets.AZURECR_REGISTRY }}/' ./manifests/deployment.yml
+        sed -i 's/TAG-DEPLOYMENT/${{ github.run_number }}/' ./manifests/deployment.yml
+
+    - name: Azure Kubernetes Service - Deployment de Web App
+      uses: Azure/k8s-deploy@v1.3
+      with:
+        namespace: ${{ env.NAMESPACE_K8S }}
+        manifests: |
+          manifests/deployment.yml
+          manifests/service.yml
+        images: |
+          '${{ env.IMAGEM_AZURECR }}:${{ github.run_number }}'
+        imagepullsecrets: |
+          webapp-k8s-secret
